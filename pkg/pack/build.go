@@ -37,11 +37,24 @@ func Build(ctx context.Context, c client.Client) (*client.Result, error) {
 	src := llb.Local(localNameContext, llb.SessionID(c.BuildOpts().SessionID), llb.SharedKeyHint("pack-src"))
 
 	// don't assume builder image has pack cli
-	img := llb.Image("alpine").Run(llb.Shlex("apk add --no-cache curl"), llb.WithCustomName("install curl"))
-	img = img.Run(llb.Shlex(`(curl -sSL "https://github.com/buildpacks/pack/releases/download/v0.24.0/pack-v0.24.0-linux.tgz" | sudo tar -C /usr/local/bin/ --no-same-owner -xzv pack)`), llb.WithCustomName("install pack cli"))
-	st := runBuilder(c, img, fmt.Sprintf(`/usr/local/bin/pack build --builder %s --path %s`, builder, "/workspace"), llb.Dir("/workspace"))
-	st.AddMount("/workspace", src, llb.Readonly)
-	st.AddMount("/tmp", llb.Scratch(), llb.AsPersistentCacheDir("buildpack-build-cache", llb.CacheMountShared))
+	img := llb.Image("alpine").
+		Run(llb.Shlex("apk add --no-cache curl"), llb.WithCustomName("installing curl")).
+		Run(llb.Shlex(`curl -sSL https://github.com/buildpacks/pack/releases/download/v0.24.0/pack-v0.24.0-linux.tgz -O`), llb.WithCustomName("fetching pack cli")).
+		Run(llb.Shlex(`tar -zxvf pack-v0.24.0-linux.tgz`), llb.WithCustomName("unzipping pack cli")).
+		Run(llb.Shlex(`mv pack /usr/local/bin/pack`), llb.WithCustomName("installing pack cli"))
+	build := runBuilder(c, img, fmt.Sprintf(`/usr/local/bin/pack build %s --builder %s --path %s`, "temp", builder, "/workspace"), llb.Dir("/workspace"))
+	build.AddMount("/workspace", src, llb.Readonly)
+	build.AddMount("/tmp", llb.Scratch(), llb.AsPersistentCacheDir("buildpack-build-cache", llb.CacheMountShared))
+	
+	// TODO: offer two routes: direct to registry via pack CLI. but then what about buildkit?
+	// what purpose did buildkit serve as there's nothing to parallelize
+
+	// TODO: for the second case, export temp that was built by pack cli. output is an image, not a directory...
+	build.Run(llb.Shlex("docker save temp > /out/temp.tar"))
+	// FIXME: this should be the dest image i.e. the run image
+	extract := llb.Image("alpine").Run(llb.Shlex(``), llb.WithCustomName("copy temp image to stack"), llb.Dir("/in"))
+	extract.AddMount("/in", build.Root(), llb.SourcePath("out"), llb.Readonly)
+	st := extract.AddMount("/out", llb.Image(runName))
 
 	def, err := st.Marshal(ctx, llb.WithCaps(c.BuildOpts().LLBCaps))
 	if err != nil {
